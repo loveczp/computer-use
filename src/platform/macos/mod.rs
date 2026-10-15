@@ -38,25 +38,33 @@ fn run_jxa(script: &str) -> Result<String, Box<dyn std::error::Error + Send + Sy
 pub fn list_windows() -> Result<Vec<Window>, Box<dyn std::error::Error + Send + Sync>> {
     let script = r#"
 ObjC.import('CoreGraphics');
-var windowList = CGWindowListCopyWindowInfo($.kCGWindowListOptionOnScreenOnly | $.kCGWindowListExcludeDesktopElements, $.kCGNullWindowID);
-var count = CFArrayGetCount(windowList);
+var windowList = $.CGWindowListCopyWindowInfo($.kCGWindowListOptionOnScreenOnly | $.kCGWindowListExcludeDesktopElements, $.kCGNullWindowID);
+var count = $.CFArrayGetCount(windowList);
 var list = [];
 for (var i = 0; i < count; i++) {
-    var dict = CFArrayGetValueAtIndex(windowList, i);
-    var layer = ObjC.unwrap(CFDictionaryGetValue(dict, $.kCGWindowLayer));
+    var dict = $.CFArrayGetValueAtIndex(windowList, i);
+    var obj = ObjC.castRefToObject(dict);
+    var layerVal = obj.valueForKey("kCGWindowLayer");
+    var layer = layerVal ? layerVal.js : null;
     if (layer === 0) {
-        var id = ObjC.unwrap(CFDictionaryGetValue(dict, $.kCGWindowNumber));
-        var owner = ObjC.unwrap(CFDictionaryGetValue(dict, $.kCGWindowOwnerName)) || "";
-        var name = ObjC.unwrap(CFDictionaryGetValue(dict, $.kCGWindowName)) || "";
-        var bounds = ObjC.unwrap(CFDictionaryGetValue(dict, $.kCGWindowBounds));
-        var rect = bounds ? {
-            x: Math.round(bounds.X),
-            y: Math.round(bounds.Y),
-            width: Math.round(bounds.Width),
-            height: Math.round(bounds.Height)
-        } : null;
-        if (owner !== "Dock" && owner !== "Window Server") {
-            list.push({ id: id, app: owner, title: name, rect: rect });
+        var idVal = obj.valueForKey("kCGWindowNumber");
+        var id = idVal ? idVal.js : 0;
+        var ownerVal = obj.valueForKey("kCGWindowOwnerName");
+        var owner = (ownerVal && ownerVal.js) ? ownerVal.js : "";
+        var nameVal = obj.valueForKey("kCGWindowName");
+        var name = (nameVal && nameVal.js) ? nameVal.js : "";
+        var bounds = obj.valueForKey("kCGWindowBounds");
+        var rect = null;
+        if (bounds) {
+            rect = {
+                x: Math.round(bounds.valueForKey("X").js),
+                y: Math.round(bounds.valueForKey("Y").js),
+                width: Math.round(bounds.valueForKey("Width").js),
+                height: Math.round(bounds.valueForKey("Height").js)
+            };
+        }
+        if (owner !== "Dock" && owner !== "Window Server" && owner !== "") {
+            list.push({ id: id, app: owner, title: name.length > 0 ? name : null, rect: rect });
         }
     }
 }
@@ -76,14 +84,20 @@ tell application "System Events"
     set appList to every application process whose background only is false
     repeat with p in appList
         set pName to name of p
-        set pWins to every window of p
-        repeat with w in pWins
-            set wName to name of w
-            set wPos to position of w
-            set wSize to size of w
-            set end of res to "{\"id\":" & 0 & ",\"app\":\"" & pName & "\",\"title\":\"" & wName & "\",\"rect\":{\"x\":" & (item 1 of wPos) & ",\"y\":" & (item 2 of wPos) & ",\"width\":" & (item 1 of wSize) & ",\"height\":" & (item 2 of wSize) & "}}"
-        end repeat
+        try
+            set pWins to every window of p
+            repeat with w in pWins
+                set wName to ""
+                try
+                    set wName to name of w
+                end try
+                set wPos to position of w
+                set wSize to size of w
+                set end of res to "{\"id\":0,\"app\":\"" & pName & "\",\"title\":\"" & wName & "\",\"rect\":{\"x\":" & (item 1 of wPos) & ",\"y\":" & (item 2 of wPos) & ",\"width\":" & (item 1 of wSize) & ",\"height\":" & (item 2 of wSize) & "}}"
+            end repeat
+        end try
     end repeat
+    set AppleScript's text item delimiters to ","
     return "[" & (res as string) & "]"
 end tell
 "#;
@@ -129,16 +143,26 @@ pub fn get_window(id: usize) -> Result<Window, Box<dyn std::error::Error + Send 
 /// Bring a window to foreground (restoring and focusing its parent app).
 pub fn activate_window(id: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let win = get_window(id)?;
+    let escaped_app = win.app.replace('\\', "\\\\").replace('\'', "\\'");
     let script = format!(
         r#"
-tell application "System Events"
-    set frontmost of (first application process whose name is "{}") to true
-end tell
-tell application "{}" to activate
+ObjC.import('AppKit');
+var apps = $.NSWorkspace.sharedWorkspace.runningApplications;
+var count = apps.count;
+for (var i = 0; i < count; i++) {{
+    var a = apps.objectAtIndex(i);
+    var name = a.localizedName;
+    if (name && name.js === '{}') {{
+        a.activateWithOptions($.NSApplicationActivateIgnoringOtherApps);
+        break;
+    }}
+}}
 "#,
-        win.app, win.app
+        escaped_app
     );
-    run_osascript(&script)?;
+    if run_jxa(&script).is_err() {
+        let _ = Command::new("open").arg("-a").arg(&win.app).status();
+    }
     Ok(())
 }
 
@@ -214,17 +238,85 @@ pub fn inspect_accessibility(
 tell application "System Events"
     set p to first application process whose name is "{}"
     set w to front window of p
-    set allUI to entire contents of w
     set res to {{}}
-    repeat with el in allUI
+    set todo to every UI element of w
+    set elemCount to 0
+    repeat with el in todo
+        if elemCount > 120 then exit repeat
         try
             set elRole to (role of el) as string
-            set elTitle to (title of el) as string
+            set elTitle to ""
+            try
+                set elTitle to (title of el) as string
+            end try
+            if elTitle is "missing value" or elTitle is "" then
+                try
+                    set elTitle to (accessibility description of el) as string
+                end try
+            end if
+            if elTitle is "missing value" or elTitle is "" then
+                try
+                    set elTitle to (description of el) as string
+                end try
+            end if
+            if elTitle is "missing value" or elTitle is "" then
+                try
+                    set elTitle to (value of el) as string
+                end try
+            end if
+            if elTitle is "missing value" then set elTitle to ""
             set elPos to (position of el)
             set elSize to (size of el)
-            set end of res to "{{\"role\":\"" & elRole & "\",\"name\":\"" & elTitle & "\",\"x\":" & (item 1 of elPos) & ",\"y\":" & (item 2 of elPos) & ",\"width\":" & (item 1 of elSize) & ",\"height\":" & (item 2 of elSize) & "}}"
+            
+            set AppleScript's text item delimiters to "\""
+            set titleParts to text items of elTitle
+            set AppleScript's text item delimiters to "\\\""
+            set escapedTitle to titleParts as string
+            
+            set end of res to "{{\"role\":\"" & elRole & "\",\"name\":\"" & escapedTitle & "\",\"x\":" & (item 1 of elPos) & ",\"y\":" & (item 2 of elPos) & ",\"width\":" & (item 1 of elSize) & ",\"height\":" & (item 2 of elSize) & "}}"
+            set elemCount to elemCount + 1
+            
+            try
+                repeat with child in (every UI element of el)
+                    if elemCount > 120 then exit repeat
+                    try
+                        set cRole to (role of child) as string
+                        set cTitle to ""
+                        try
+                            set cTitle to (title of child) as string
+                        end try
+                        if cTitle is "missing value" or cTitle is "" then
+                            try
+                                set cTitle to (accessibility description of child) as string
+                            end try
+                        end if
+                        if cTitle is "missing value" or cTitle is "" then
+                            try
+                                set cTitle to (description of child) as string
+                            end try
+                        end if
+                        if cTitle is "missing value" or cTitle is "" then
+                            try
+                                set cTitle to (value of child) as string
+                            end try
+                        end if
+                        if cTitle is "missing value" then set cTitle to ""
+                        set cPos to (position of child)
+                        set cSize to (size of child)
+                        
+                        set AppleScript's text item delimiters to "\""
+                        set cParts to text items of cTitle
+                        set AppleScript's text item delimiters to "\\\""
+                        set escapedCTitle to cParts as string
+                        
+                        set end of res to "{{\"role\":\"" & cRole & "\",\"name\":\"" & escapedCTitle & "\",\"x\":" & (item 1 of cPos) & ",\"y\":" & (item 2 of cPos) & ",\"width\":" & (item 1 of cSize) & ",\"height\":" & (item 2 of cSize) & "}}"
+                        set elemCount to elemCount + 1
+                    end try
+                end repeat
+            end try
         end try
     end repeat
+    set AppleScript's text item delimiters to ","
     return "[" & (res as string) & "]"
 end tell
 "#,
@@ -314,9 +406,10 @@ pub fn click_at(
         r#"
 ObjC.import('CoreGraphics');
 var pt = {{ x: {}, y: {} }};
-var btnDown = '{}' === 'right' ? $.kCGEventRightMouseDown : $.kCGEventLeftMouseDown;
-var btnUp = '{}' === 'right' ? $.kCGEventRightMouseUp : $.kCGEventLeftMouseUp;
-var mouseBtn = '{}' === 'right' ? $.kCGMouseButtonRight : $.kCGMouseButtonLeft;
+var b = '{}';
+var btnDown = b === 'right' ? $.kCGEventRightMouseDown : (b === 'middle' ? $.kCGEventOtherMouseDown : $.kCGEventLeftMouseDown);
+var btnUp = b === 'right' ? $.kCGEventRightMouseUp : (b === 'middle' ? $.kCGEventOtherMouseUp : $.kCGEventLeftMouseUp);
+var mouseBtn = b === 'right' ? $.kCGMouseButtonRight : (b === 'middle' ? $.kCGMouseButtonCenter : $.kCGMouseButtonLeft);
 for (var i = 0; i < {}; i++) {{
     var d = $.CGEventCreateMouseEvent(null, btnDown, pt, mouseBtn);
     var u = $.CGEventCreateMouseEvent(null, btnUp, pt, mouseBtn);
@@ -328,7 +421,7 @@ for (var i = 0; i < {}; i++) {{
     $.CGEventPost($.kCGHIDEventTap, u);
 }}
 "#,
-        screen_x, screen_y, button, button, button, count, count
+        screen_x, screen_y, button, count, count
     );
 
     run_jxa(&script)?;
@@ -352,9 +445,10 @@ pub fn click_element(
         r#"
 ObjC.import('CoreGraphics');
 var pt = {{ x: {}, y: {} }};
-var btnDown = '{}' === 'right' ? $.kCGEventRightMouseDown : $.kCGEventLeftMouseDown;
-var btnUp = '{}' === 'right' ? $.kCGEventRightMouseUp : $.kCGEventLeftMouseUp;
-var mouseBtn = '{}' === 'right' ? $.kCGMouseButtonRight : $.kCGMouseButtonLeft;
+var b = '{}';
+var btnDown = b === 'right' ? $.kCGEventRightMouseDown : (b === 'middle' ? $.kCGEventOtherMouseDown : $.kCGEventLeftMouseDown);
+var btnUp = b === 'right' ? $.kCGEventRightMouseUp : (b === 'middle' ? $.kCGEventOtherMouseUp : $.kCGEventLeftMouseUp);
+var mouseBtn = b === 'right' ? $.kCGMouseButtonRight : (b === 'middle' ? $.kCGMouseButtonCenter : $.kCGMouseButtonLeft);
 for (var i = 0; i < {}; i++) {{
     var d = $.CGEventCreateMouseEvent(null, btnDown, pt, mouseBtn);
     var u = $.CGEventCreateMouseEvent(null, btnUp, pt, mouseBtn);
@@ -366,7 +460,7 @@ for (var i = 0; i < {}; i++) {{
     $.CGEventPost($.kCGHIDEventTap, u);
 }}
 "#,
-        center_x, center_y, button, button, button, count, count
+        center_x, center_y, button, count, count
     );
 
     run_jxa(&script)?;
