@@ -150,10 +150,10 @@ enum Commands {
         #[arg(long, default_value_t = 0)]
         y: i32,
         /// Horizontal scroll delta
-        #[arg(long, default_value_t = 0)]
+        #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
         dx: i32,
         /// Vertical scroll delta (negative = down, positive = up)
-        #[arg(long, default_value_t = 0)]
+        #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
         dy: i32,
     },
     /// Drag mouse from one point to another
